@@ -22,14 +22,20 @@ jobs:
             rust_target: x86_64-unknown-linux-musl # Linux 静态编译，兼容性最佳
             artifact_name: p-wav-cli-linux-x64
             archive_format: tar.gz # Linux 和 macOS 使用 tar.gz
+            # Linux 环境下，我们使用 Bash
+            artifact_prepare_shell: bash
           - os: macos-latest
             rust_target: x86_64-apple-darwin # macOS Intel 64-bit (M1/M2/M3通过Rosetta 2运行)
             artifact_name: p-wav-cli-macos-x64
             archive_format: tar.gz
+            # macOS 环境下，我们使用 Bash
+            artifact_prepare_shell: bash
           - os: windows-latest
             rust_target: x86_64-pc-windows-msvc # Windows 64-bit (MSVC toolchain)
             artifact_name: p-wav-cli-windows-x64
             archive_format: zip # Windows 使用 zip
+            # Windows 环境下，我们使用 PowerShell
+            artifact_prepare_shell: powershell
 
     runs-on: ${{ matrix.os }}
 
@@ -56,44 +62,48 @@ jobs:
           # 使用 --target 参数进行交叉编译
           cargo build --release --target ${{ matrix.rust_target }}
 
-      - name: Prepare artifact
-        id: prepare_artifact # 为此步骤分配ID，以便后续步骤引用其输出
-        # 动态选择 shell：Windows 使用 PowerShell，其他使用 Bash
-        shell: ${{ matrix.os == 'windows-latest' && 'powershell' || 'bash' }}
+      # --- Linux 和 macOS 的打包步骤 ---
+      - name: Prepare artifact (Linux/macOS)
+        id: prepare_artifact_unix
+        if: matrix.os != 'windows-latest' # 仅当不是 Windows 时运行
+        shell: ${{ matrix.artifact_prepare_shell }} # 使用 Bash
         run: |
-          $EXECUTABLE_NAME="p-wav-cli" # 你的可执行文件名称
-          $ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
+          EXECUTABLE_NAME="p-wav-cli"
+          ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
+          ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
 
-          if ("${{ matrix.os }}" -eq "windows-latest") {
-            $ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
-            # 在 Windows 上，可执行文件会有 .exe 后缀
-            Set-Location $ARTIFACT_DIR # PowerShell 中的 cd
-            Compress-Archive -Path "$EXECUTABLE_NAME.exe" -DestinationPath "$ARCHIVE_FILE" -Force
-            # PowerShell 中设置输出变量
-            echo "zip_path=$((Get-Location).Path)/$ARCHIVE_FILE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            $ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
-            # 在 Linux 和 macOS 上，可执行文件没有后缀
-            cd "$ARTIFACT_DIR"
-            # 对于 tar.gz 格式
-            if [ "${{ matrix.archive_format }}" == "tar.gz" ]; then
-                tar -czvf "$ARCHIVE_FILE" "$EXECUTABLE_NAME"
-            # 如果是其他 Unix-like 系统的 zip (这里不会用到，因为定义了 tar.gz)
-            elif [ "${{ matrix.archive_format }}" == "zip" ]; then
-                zip -j "$ARCHIVE_FILE" "$EXECUTABLE_NAME" # -j 是 junk paths, 只压缩文件，不包括目录结构
-            fi
-            # Bash 中设置输出变量
-            echo "zip_path=$(pwd)/$ARCHIVE_FILE" >> $GITHUB_OUTPUT
-            echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" >> $GITHUB_OUTPUT
-          }
+          cd "$ARTIFACT_DIR"
+          tar -czvf "$ARCHIVE_FILE" "$EXECUTABLE_NAME"
+          
+          echo "zip_path=$(pwd)/$ARCHIVE_FILE" >> $GITHUB_OUTPUT
+          echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" >> $GITHUB_OUTPUT
+
+      # --- Windows 的打包步骤 ---
+      - name: Prepare artifact (Windows)
+        id: prepare_artifact_windows
+        if: matrix.os == 'windows-latest' # 仅当是 Windows 时运行
+        shell: ${{ matrix.artifact_prepare_shell }} # 使用 PowerShell
+        run: |
+          $EXECUTABLE_NAME="p-wav-cli"
+          $ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
+          $ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
+
+          Set-Location $ARTIFACT_DIR # PowerShell 中的 cd
+          Compress-Archive -Path "$EXECUTABLE_NAME.exe" -DestinationPath "$ARCHIVE_FILE" -Force
+          
+          # PowerShell 中设置输出变量，注意路径的写法
+          echo "zip_path=$((Get-Location).Path)/$ARCHIVE_FILE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload artifact to GitHub Release
         # 仅当工作流由标签推送触发时才执行此步骤
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{ steps.prepare_artifact.outputs.zip_path }} # 使用上一步准备好的压缩文件路径
+          # 根据当前 OS 选择正确的 prepare_artifact 步骤的输出
+          files: |
+            ${{ (matrix.os != 'windows-latest' && steps.prepare_artifact_unix.outputs.zip_path) || '' }}
+            ${{ (matrix.os == 'windows-latest' && steps.prepare_artifact_windows.outputs.zip_path) || '' }}
           prerelease: false # 设置为 true 如果是预发布版本
           tag_name: ${{ github.ref }} # 使用当前的 Git 标签作为 Release 的标签名
         env:
