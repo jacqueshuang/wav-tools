@@ -7,9 +7,8 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+' # 匹配类似 v1.0.0, v1.2.3 这样的语义化版本标签
 
 jobs:
-  build-and-release:
-    name: Build for ${{ matrix.os }}
-
+  build-and-package: # 新增一个 job，专门用于构建和打包
+    name: Build & Package for ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,9 +50,8 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.rust_target }}
 
-      # --- Linux 和 macOS 的打包步骤 ---
-      - name: Prepare artifact (Linux/macOS)
-        id: prepare_artifact_unix
+      # --- 打包可执行文件 ---
+      - name: Create archive (Linux/macOS)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -63,37 +61,53 @@ jobs:
 
           cd "$ARTIFACT_DIR"
           tar -czvf "$ARCHIVE_FILE" "$EXECUTABLE_NAME"
-          
-          echo "zip_path=$(pwd)/$ARCHIVE_FILE" >> $GITHUB_OUTPUT
-          echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" >> $GITHUB_OUTPUT
+          # 输出归档文件的相对路径，方便 upload-artifact 查找
+          echo "archive_path=$ARTIFACT_DIR/$ARCHIVE_FILE" >> $GITHUB_OUTPUT
+        id: archive_unix # 给这个步骤一个ID
 
-      # --- Windows 的打包步骤 ---
-      - name: Prepare artifact (Windows)
-        id: prepare_artifact_windows
+      - name: Create archive (Windows)
         if: matrix.os == 'windows-latest'
-        shell: powershell # 明确指定 shell 为 powershell
+        shell: powershell
         run: |
           $EXECUTABLE_NAME="p-wav-cli"
           $ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
-          $ARCHIVE_FILE_NAME="${{ matrix.artifact_name }}.${{ matrix.archive_format }}" # 仅文件名
-
-          Set-Location $ARTIFACT_DIR # PowerShell 中的 cd
+          $ARCHIVE_FILE_NAME="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
+          
+          Set-Location $ARTIFACT_DIR
           Compress-Archive -Path "$EXECUTABLE_NAME.exe" -DestinationPath "$ARCHIVE_FILE_NAME" -Force
-          
-          # ✅ 修正：更可靠的路径构建方式，使用 Join-Path
-          $full_archive_path = Join-Path -Path $((Get-Location).Path) -ChildPath "$ARCHIVE_FILE_NAME"
-          
-          # PowerShell 中设置输出变量
-          echo "zip_path=$full_archive_path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # 输出归档文件的相对路径
+          echo "archive_path=$ARTIFACT_DIR/$ARCHIVE_FILE_NAME" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: archive_windows # 给这个步骤一个ID
 
-      - name: Upload artifact to GitHub Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4 # 使用 actions/upload-artifact 上传产物
         with:
-          files: |
-            ${{ (matrix.os != 'windows-latest' && steps.prepare_artifact_unix.outputs.zip_path) || '' }}
-            ${{ (matrix.os == 'windows-latest' && steps.prepare_artifact_windows.outputs.zip_path) || '' }}
+          name: ${{ matrix.artifact_name }} # artifact 名称
+          path: |
+            ${{ (matrix.os != 'windows-latest' && steps.archive_unix.outputs.archive_path) || '' }}
+            ${{ (matrix.os == 'windows-latest' && steps.archive_windows.outputs.archive_path) || '' }}
+          # if-no-files-found: error # 如果文件没找到则报错
+
+  release-assets: # 新增一个 job，专门用于发布 Release
+    name: Release Assets
+    needs: build-and-package # 确保在构建和打包 job 完成后才运行
+    runs-on: ubuntu-latest # 在一个统一的环境中处理发布，通常是 Ubuntu
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4 # 下载所有产物
+        with:
+          path: downloaded_artifacts # 将所有产物下载到这个目录
+
+      - name: List downloaded artifacts (for debugging)
+        run: ls -R downloaded_artifacts/
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') # 仅当是标签推送时才创建 Release
+        with:
+          # files 参数现在可以指定一个模式，匹配下载下来的文件
+          files: downloaded_artifacts/*/p-wav-cli-*.* # 匹配所有下载产物目录中的打包文件
           prerelease: false
           tag_name: ${{ github.ref }}
         env:
