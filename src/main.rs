@@ -1,16 +1,14 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
-use rand::Rng; // 引入 rand::Rng trait
+use rand::Rng;
 
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::probe::Hint;
-// use symphonia::core::units::Time; // ✅ 修正：移除未使用的导入
 
-// 引入 hound 库用于写入 WAV 文件
 use hound::{WavWriter, SampleFormat as HoundSampleFormat};
 
 /// 简单的多格式音频交错复制工具
@@ -28,7 +26,7 @@ struct Args {
     output_prefix: String,
 
     /// 每个随机交替块的最大持续时间 (秒). 实际时长将在 1 秒到此最大值之间随机选择。
-    #[arg(short, long, default_value_t = 10)] // 默认最大为 10 秒
+    #[arg(short, long, default_value_t = 5)] // 默认最大为 5 秒
     max_chunk_duration: u64,
 }
 
@@ -72,7 +70,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. 选择音频轨道
     let track = format.tracks().iter()
-        // ✅ 修正：检查 codec_params.codec 是否为 Some，而不是 CodecType::None
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| "未找到音频轨道".to_string())?;
 
@@ -100,100 +97,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sample_buffer_converter: Option<SampleBuffer<i16>> = None; // 用于将不同格式的样本转换为 i16
 
     let mut current_chunk_idx = 0;
-    let mut processed_samples_in_total: u64 = 0;
-    let mut total_duration_frames: u64 = 0; // 声明为 mut
+    let mut processed_frames_for_progress: u64 = 0; // 追踪已处理的每声道帧数，用于进度条
+    let mut total_duration_frames: u64 = 0; // 总的每声道帧数 (Symphonia的n_frames)
 
     // 估算总时长（帧数），用于进度显示。
-    // Symphonia 的 CodecParameters 在不同版本可能字段不同。
-    // 最可靠的方式是通过遍历所有包来累加解码帧的 duration，但这会慢很多。
-    // 这里我们尝试使用 n_frames，如果不存在，则直接使用 1 进行进度条除法，并打印警告。
     if let Some(n_frames) = track.codec_params.n_frames {
         total_duration_frames = n_frames;
     } else {
         println!("警告：无法获取精确的总帧数，进度显示可能不准确。");
-        // 为确保除数不为零，给一个很大的默认值，或者直接禁用进度条
         total_duration_frames = 1; // 避免除零错误
     }
 
-
     let mut rng = rand::thread_rng();
 
-    'main_loop: loop {
-        // 随机生成当前块的持续时间
-        let current_chunk_duration_seconds = rng.gen_range(MIN_CHUNK_DURATION_SECONDS..=max_chunk_duration_seconds);
-        // 计算当前块所需的样本数 (所有声道)
-        // 注意：这里是目标样本数，实际读取可能不足
-        let target_samples_for_this_chunk = sample_rate as usize * current_chunk_duration_seconds as usize * channels as usize;
+    // 用于暂存从解码帧中读取但未完全放入当前 chunk 的样本
+    let mut leftover_samples: Vec<i16> = Vec::new();
 
-        let mut samples_read_in_this_chunk = 0;
-        let mut chunk_samples: Vec<i16> = Vec::with_capacity(target_samples_for_this_chunk);
+    'main_loop: loop {
+        let current_chunk_duration_seconds = rng.gen_range(MIN_CHUNK_DURATION_SECONDS..=max_chunk_duration_seconds);
+
+        // 计算当前块所需的总交错样本数
+        let target_interleaved_samples_for_this_chunk = (sample_rate as u64 * current_chunk_duration_seconds * channels as u64) as usize;
+
+        // ✅ 修正：确保 current_chunk_samples 只包含当前块的样本，并且精确控制其大小
+        let mut current_chunk_samples: Vec<i16> = Vec::with_capacity(target_interleaved_samples_for_this_chunk);
+        let mut samples_collected_in_current_chunk = 0;
         let mut end_of_file = false;
+
+        // 首先处理剩余样本
+        let num_from_leftover = (target_interleaved_samples_for_this_chunk - samples_collected_in_current_chunk).min(leftover_samples.len());
+        current_chunk_samples.extend_from_slice(&leftover_samples[..num_from_leftover]);
+        samples_collected_in_current_chunk += num_from_leftover;
+        leftover_samples.drain(..num_from_leftover); // 移除已使用的剩余样本
 
         // 循环读取数据包并解码，直到收集到足够当前块的样本
         'decode_loop: loop {
-            // 如果已经收集到足够样本，且还有数据未写入，则跳出解码循环
-            if samples_read_in_this_chunk >= target_samples_for_this_chunk {
+            if samples_collected_in_current_chunk >= target_interleaved_samples_for_this_chunk {
                 break 'decode_loop;
             }
 
             match format.next_packet() {
                 Ok(packet) => {
-                    // 如果不是当前音频轨道的包，跳过
                     if packet.track_id() != track_id {
                         continue;
                     }
 
-                    // 解码数据包
                     match decoder.decode(&packet) {
                         Ok(decoded_frame) => {
-                            // 如果样本转换器还没有初始化，根据解码帧的格式进行初始化
                             if sample_buffer_converter.is_none() {
                                 let spec = decoded_frame.spec();
-                                let capacity = decoded_frame.capacity(); // 使用 capacity 而非 duration
-                                // ✅ 修正：对 spec 解引用
-                                sample_buffer_converter = Some(SampleBuffer::<i16>::new(capacity as u64, *spec));
+                                sample_buffer_converter = Some(SampleBuffer::<i16>::new(decoded_frame.capacity() as u64, *spec));
                             }
 
-                            // 转换样本到 i16
                             if let Some(converter) = &mut sample_buffer_converter {
-                                // ✅ 修正：使用 copy_interleaved_ref 方法，并移除 `?`
-                                converter.copy_interleaved_ref(decoded_frame); // <-- 移除 ?
-                                let samples = converter.samples();
+                                converter.copy_interleaved_ref(decoded_frame);
+                                let samples_from_frame = converter.samples(); // 这是该帧的所有交错样本
 
-                                // 将样本添加到当前块
-                                for &s in samples {
-                                    if samples_read_in_this_chunk < target_samples_for_this_chunk {
-                                        chunk_samples.push(s);
-                                        samples_read_in_this_chunk += 1;
-                                    } else {
-                                        // 已经收集到足够样本，将剩余样本放回缓冲区（如果有）
-                                        // Symphonia 没有内置的回溯机制，这里直接跳出
-                                        // 这里的逻辑会丢弃当前帧中超出目标chunk_samples容量的部分
-                                        break;
-                                    }
+                                // 计算还需要多少样本来填满当前 chunk
+                                let remaining_in_chunk = target_interleaved_samples_for_this_chunk - samples_collected_in_current_chunk;
+                                // 从当前帧中取多少样本
+                                let to_take_from_frame = remaining_in_chunk.min(samples_from_frame.len());
+
+                                current_chunk_samples.extend_from_slice(&samples_from_frame[..to_take_from_frame]);
+                                samples_collected_in_current_chunk += to_take_from_frame;
+
+                                // 如果当前帧还有剩余样本，保存到 leftover_samples
+                                if to_take_from_frame < samples_from_frame.len() {
+                                    leftover_samples.extend_from_slice(&samples_from_frame[to_take_from_frame..]);
                                 }
-                                // 如果这一帧的解码使得我们收集了足够多的样本，就跳出解码循环
-                                if samples_read_in_this_chunk >= target_samples_for_this_chunk {
+
+                                if samples_collected_in_current_chunk >= target_interleaved_samples_for_this_chunk {
                                     break 'decode_loop;
                                 }
                             }
                         }
                         Err(SymphoniaError::DecodeError(_)) => {
-                            // 解码错误，可能是损坏的数据，跳过
                             continue;
                         }
                         Err(err) => return Err(format!("解码时发生错误：{}", err).into()),
                     }
                 }
                 Err(SymphoniaError::ResetRequired) => {
-                    // 解码器需要重置，通常发生在 Seek 操作后，但这里我们不 Seek
                     decoder.reset();
                 }
                 Err(SymphoniaError::IoError(err)) => {
-                    // IO 错误，可能是文件结束
                     if err.kind() == io::ErrorKind::UnexpectedEof {
                         end_of_file = true;
-                        break 'decode_loop; // 退出解码循环
+                        break 'decode_loop;
                     }
                     return Err(format!("IO 错误：{}", err).into());
                 }
@@ -202,17 +192,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 如果当前块没有读取到任何样本，并且已经到达文件末尾，则退出主循环
-        if samples_read_in_this_chunk == 0 && end_of_file {
+        if samples_collected_in_current_chunk == 0 && end_of_file {
             break 'main_loop;
         }
 
         // 创建一个与当前块相同大小的静音块
-        let silence_chunk: Vec<i16> = vec![0; samples_read_in_this_chunk];
+        let silence_chunk: Vec<i16> = vec![0; samples_collected_in_current_chunk];
 
         // 根据当前块索引决定写入哪个文件有声音，哪个文件是静音
         if current_chunk_idx % 2 == 0 {
             // 偶数块：文件1有声音，文件2静音
-            for &sample in &chunk_samples {
+            for &sample in &current_chunk_samples {
                 writer1.write_sample(sample)?;
             }
             for &sample in &silence_chunk {
@@ -223,22 +213,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for &sample in &silence_chunk {
                 writer1.write_sample(sample)?;
             }
-            for &sample in &chunk_samples {
+            for &sample in &current_chunk_samples {
                 writer2.write_sample(sample)?;
             }
         }
 
         current_chunk_idx += 1;
-        processed_samples_in_total += samples_read_in_this_chunk as u64;
+        // ✅ 修正：进度条根据处理的总帧数来计算
+        // samples_collected_in_current_chunk 是当前块的交错样本数
+        // 转换为每声道帧数：samples_collected_in_current_chunk / channels
+        processed_frames_for_progress += (samples_collected_in_current_chunk as u64) / (channels as u64);
 
         // 打印进度
-        let progress_percent = (processed_samples_in_total as f64 / total_duration_frames as f64) * 100.0;
+        let progress_percent = (processed_frames_for_progress as f64 / total_duration_frames as f64) * 100.0;
         print!("\r正在处理... {:.2}%", progress_percent.min(100.0)); // 确保不超过100%
         io::stdout().flush()?;
 
         // 如果在读取当前块时到达了文件末尾，并且当前块的样本数小于目标样本数，
         // 则说明文件已完全读取，处理完当前剩下的样本后退出主循环。
-        if end_of_file && samples_read_in_this_chunk < target_samples_for_this_chunk {
+        if end_of_file && samples_collected_in_current_chunk < target_interleaved_samples_for_this_chunk {
             break 'main_loop;
         }
     }
