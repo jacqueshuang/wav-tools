@@ -22,20 +22,14 @@ jobs:
             rust_target: x86_64-unknown-linux-musl # Linux 静态编译，兼容性最佳
             artifact_name: p-wav-cli-linux-x64
             archive_format: tar.gz # Linux 和 macOS 使用 tar.gz
-            # Linux 环境下，我们使用 Bash
-            artifact_prepare_shell: bash
           - os: macos-latest
             rust_target: x86_64-apple-darwin # macOS Intel 64-bit (M1/M2/M3通过Rosetta 2运行)
             artifact_name: p-wav-cli-macos-x64
             archive_format: tar.gz
-            # macOS 环境下，我们使用 Bash
-            artifact_prepare_shell: bash
           - os: windows-latest
             rust_target: x86_64-pc-windows-msvc # Windows 64-bit (MSVC toolchain)
             artifact_name: p-wav-cli-windows-x64
             archive_format: zip # Windows 使用 zip
-            # Windows 环境下，我们使用 PowerShell
-            artifact_prepare_shell: powershell
 
     runs-on: ${{ matrix.os }}
 
@@ -66,7 +60,7 @@ jobs:
       - name: Prepare artifact (Linux/macOS)
         id: prepare_artifact_unix
         if: matrix.os != 'windows-latest' # 仅当不是 Windows 时运行
-        shell: ${{ matrix.artifact_prepare_shell }} # 使用 Bash
+        shell: bash # ✅ 修正：明确指定 shell 为 bash
         run: |
           EXECUTABLE_NAME="p-wav-cli"
           ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
@@ -82,7 +76,7 @@ jobs:
       - name: Prepare artifact (Windows)
         id: prepare_artifact_windows
         if: matrix.os == 'windows-latest' # 仅当是 Windows 时运行
-        shell: ${{ matrix.artifact_prepare_shell }} # 使用 PowerShell
+        shell: powershell # ✅ 修正：明确指定 shell 为 powershell
         run: |
           $EXECUTABLE_NAME="p-wav-cli"
           $ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
