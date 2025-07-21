@@ -5,95 +5,96 @@ on:
   # 例如：git tag -a v1.0.0 -m "Release v1.0.0" && git push origin v1.0.0
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+' # 匹配类似 v1.0.0, v1.2.3 这样的标签
+      - 'v[0-9]+.[0-9]+.[0-9]+' # 匹配类似 v1.0.0, v1.2.3 这样的语义化版本标签
 
 jobs:
   build-and-release:
     name: Build for ${{ matrix.os }}
 
-    # 定义要构建的操作系统矩阵
+    # 定义要构建的操作系统和对应的 Rust 目标
     strategy:
       fail-fast: false # 即使一个平台构建失败，其他平台也会继续
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust_target: [x86_64-unknown-linux-gnu, x86_64-apple-darwin, x86_64-pc-windows-msvc]
-        # 对于 macOS 和 Linux，我们通常使用 x86_64。
-        # 对于 M1 Mac (aarch64)，可能需要单独配置，但 x86_64-apple-darwin 通常兼容。
-        # 如果你的 Linux 也需要 ARM64 (aarch64) 支持，可以再加一个 ubuntu-latest / aarch64-unknown-linux-gnu
-        # windows-latest 默认是 x86_64-pc-windows-msvc
-
+        # 定义每个操作系统对应的 Rust 交叉编译目标和生成的文件名
         include:
           - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl # Linux 静态编译，兼容性最佳
             artifact_name: p-wav-cli-linux-x64
-            # Linux 需要 musl 静态链接，以减少运行时依赖，确保在更多系统上运行
-            # 如果不使用 musl，则需要确保目标系统有 glibc 或其他依赖
-            cross_target: x86_64-unknown-linux-musl # 使用 musl 目标
+            archive_format: tar.gz # Linux 和 macOS 使用 tar.gz
           - os: macos-latest
-            artifact_name: p-wav-cli-macos-x64 # 这里的 x64 泛指 Intel 或 Rosetta2 兼容 M1
-            cross_target: x86_64-apple-darwin
+            rust_target: x86_64-apple-darwin # macOS Intel 64-bit (M1/M2/M3通过Rosetta 2运行)
+            artifact_name: p-wav-cli-macos-x64
+            archive_format: tar.gz
           - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc # Windows 64-bit (MSVC toolchain)
             artifact_name: p-wav-cli-windows-x64
-            cross_target: x86_64-pc-windows-msvc
+            archive_format: zip # Windows 使用 zip
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4 # 使用 actions/checkout@v4 来获取你的代码
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable # 使用 stable 版本，因为你的代码已经修复了 nightly 特性问题
-        # 如果你的代码仍然依赖 nightly features (例如 edition2024)，你需要在这里指定 channel: nightly
+        uses: dtolnay/rust-toolchain@stable # 安装 Rust stable 工具链
         with:
-          toolchain: stable # 默认为 stable
-          target: ${{ matrix.cross_target }}
-          # profile: minimal # 可以选择 minimal profile 减少安装时间
+          toolchain: stable
+          target: ${{ matrix.rust_target }}
 
       - name: Install cross-compilation tools (Linux musl)
-        if: matrix.os == 'ubuntu-latest' && matrix.cross_target == 'x86_64-unknown-linux-musl'
+        # 仅在 Ubuntu 上构建 musl 目标时运行
+        if: matrix.os == 'ubuntu-latest' && matrix.rust_target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          rustup target add ${{ matrix.cross_target }}
+          sudo apt-get install -y musl-tools # 安装 musl 工具链
+          rustup target add ${{ matrix.rust_target }} # 确保目标被添加
 
       - name: Build project (release mode)
         run: |
-          # 针对 Windows MSVC 目标，需要设置 LINK.EXE 路径
-          # 对于 MSVC，需要确保 Visual Studio C++ build tools 是可用的
-          # GitHub Actions 的 windows-latest 镜像通常已经预装
-          cargo build --release --target ${{ matrix.cross_target }}
+          # 使用 --target 参数进行交叉编译
+          cargo build --release --target ${{ matrix.rust_target }}
 
       - name: Prepare artifact
-        id: prepare_artifact # 给这个步骤一个ID，方便后续引用
+        id: prepare_artifact # 为此步骤分配ID，以便后续步骤引用其输出
+        # 动态选择 shell：Windows 使用 PowerShell，其他使用 Bash
+        shell: ${{ matrix.os == 'windows-latest' && 'powershell' || 'bash' }}
         run: |
-          # 定义可执行文件的名称
-          EXECUTABLE_NAME="p-wav-cli"
-          ARTIFACT_PATH="target/${{ matrix.cross_target }}/release"
+          $EXECUTABLE_NAME="p-wav-cli" # 你的可执行文件名称
+          $ARTIFACT_DIR="target/${{ matrix.rust_target }}/release"
 
-          # 根据操作系统确定文件名和打包方式
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            ZIP_FILE="${{ steps.prepare_artifact.outputs.artifact_name }}.zip"
-            cd "$ARTIFACT_PATH"
-            # 压缩可执行文件
-            zip -j "$ZIP_FILE" "$EXECUTABLE_NAME.exe"
-            echo "::set-output name=zip_path::${{ github.workspace }}/${ARTIFACT_PATH}/$ZIP_FILE"
-            echo "::set-output name=archive_name::${{ matrix.artifact_name }}.zip"
-          else
-            # Linux 和 macOS 直接压缩可执行文件
-            TAR_GZ_FILE="${{ matrix.artifact_name }}.tar.gz"
-            cd "$ARTIFACT_PATH"
-            tar -czvf "$TAR_GZ_FILE" "$EXECUTABLE_NAME"
-            echo "::set-output name=zip_path::${{ github.workspace }}/${ARTIFACT_PATH}/$TAR_GZ_FILE"
-            echo "::set-output name=archive_name::${{ matrix.artifact_name }}.tar.gz"
-          fi
-        shell: bash # 明确指定 shell 为 bash，确保跨平台脚本兼容性
+          if ("${{ matrix.os }}" -eq "windows-latest") {
+            $ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
+            # 在 Windows 上，可执行文件会有 .exe 后缀
+            Set-Location $ARTIFACT_DIR # PowerShell 中的 cd
+            Compress-Archive -Path "$EXECUTABLE_NAME.exe" -DestinationPath "$ARCHIVE_FILE" -Force
+            # PowerShell 中设置输出变量
+            echo "zip_path=$((Get-Location).Path)/$ARCHIVE_FILE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $ARCHIVE_FILE="${{ matrix.artifact_name }}.${{ matrix.archive_format }}"
+            # 在 Linux 和 macOS 上，可执行文件没有后缀
+            cd "$ARTIFACT_DIR"
+            # 对于 tar.gz 格式
+            if [ "${{ matrix.archive_format }}" == "tar.gz" ]; then
+                tar -czvf "$ARCHIVE_FILE" "$EXECUTABLE_NAME"
+            # 如果是其他 Unix-like 系统的 zip (这里不会用到，因为定义了 tar.gz)
+            elif [ "${{ matrix.archive_format }}" == "zip" ]; then
+                zip -j "$ARCHIVE_FILE" "$EXECUTABLE_NAME" # -j 是 junk paths, 只压缩文件，不包括目录结构
+            fi
+            # Bash 中设置输出变量
+            echo "zip_path=$(pwd)/$ARCHIVE_FILE" >> $GITHUB_OUTPUT
+            echo "archive_name=${{ matrix.artifact_name }}.${{ matrix.archive_format }}" >> $GITHUB_OUTPUT
+          }
 
       - name: Upload artifact to GitHub Release
+        # 仅当工作流由标签推送触发时才执行此步骤
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/') # 仅当是标签推送时才创建/更新 Release
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{ steps.prepare_artifact.outputs.zip_path }}
+          files: ${{ steps.prepare_artifact.outputs.zip_path }} # 使用上一步准备好的压缩文件路径
           prerelease: false # 设置为 true 如果是预发布版本
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ github.ref }} # 使用当前的 Git 标签作为 Release 的标签名
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动提供的 Token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动提供的令牌
