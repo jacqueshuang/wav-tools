@@ -1,0 +1,1 @@
+./p-wav-cli -s 音频路径 -o 输出名字 --max-chunk-duration 最大的秒数
