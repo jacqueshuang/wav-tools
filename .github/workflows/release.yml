@@ -1,0 +1,99 @@
+name: Release Binaries
+
+on:
+  # 当你创建一个新的 Git 标签时触发此工作流
+  # 例如：git tag -a v1.0.0 -m "Release v1.0.0" && git push origin v1.0.0
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+' # 匹配类似 v1.0.0, v1.2.3 这样的标签
+
+jobs:
+  build-and-release:
+    name: Build for ${{ matrix.os }}
+
+    # 定义要构建的操作系统矩阵
+    strategy:
+      fail-fast: false # 即使一个平台构建失败，其他平台也会继续
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust_target: [x86_64-unknown-linux-gnu, x86_64-apple-darwin, x86_64-pc-windows-msvc]
+        # 对于 macOS 和 Linux，我们通常使用 x86_64。
+        # 对于 M1 Mac (aarch64)，可能需要单独配置，但 x86_64-apple-darwin 通常兼容。
+        # 如果你的 Linux 也需要 ARM64 (aarch64) 支持，可以再加一个 ubuntu-latest / aarch64-unknown-linux-gnu
+        # windows-latest 默认是 x86_64-pc-windows-msvc
+
+        include:
+          - os: ubuntu-latest
+            artifact_name: p-wav-cli-linux-x64
+            # Linux 需要 musl 静态链接，以减少运行时依赖，确保在更多系统上运行
+            # 如果不使用 musl，则需要确保目标系统有 glibc 或其他依赖
+            cross_target: x86_64-unknown-linux-musl # 使用 musl 目标
+          - os: macos-latest
+            artifact_name: p-wav-cli-macos-x64 # 这里的 x64 泛指 Intel 或 Rosetta2 兼容 M1
+            cross_target: x86_64-apple-darwin
+          - os: windows-latest
+            artifact_name: p-wav-cli-windows-x64
+            cross_target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable # 使用 stable 版本，因为你的代码已经修复了 nightly 特性问题
+        # 如果你的代码仍然依赖 nightly features (例如 edition2024)，你需要在这里指定 channel: nightly
+        with:
+          toolchain: stable # 默认为 stable
+          target: ${{ matrix.cross_target }}
+          # profile: minimal # 可以选择 minimal profile 减少安装时间
+
+      - name: Install cross-compilation tools (Linux musl)
+        if: matrix.os == 'ubuntu-latest' && matrix.cross_target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add ${{ matrix.cross_target }}
+
+      - name: Build project (release mode)
+        run: |
+          # 针对 Windows MSVC 目标，需要设置 LINK.EXE 路径
+          # 对于 MSVC，需要确保 Visual Studio C++ build tools 是可用的
+          # GitHub Actions 的 windows-latest 镜像通常已经预装
+          cargo build --release --target ${{ matrix.cross_target }}
+
+      - name: Prepare artifact
+        id: prepare_artifact # 给这个步骤一个ID，方便后续引用
+        run: |
+          # 定义可执行文件的名称
+          EXECUTABLE_NAME="p-wav-cli"
+          ARTIFACT_PATH="target/${{ matrix.cross_target }}/release"
+
+          # 根据操作系统确定文件名和打包方式
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            ZIP_FILE="${{ steps.prepare_artifact.outputs.artifact_name }}.zip"
+            cd "$ARTIFACT_PATH"
+            # 压缩可执行文件
+            zip -j "$ZIP_FILE" "$EXECUTABLE_NAME.exe"
+            echo "::set-output name=zip_path::${{ github.workspace }}/${ARTIFACT_PATH}/$ZIP_FILE"
+            echo "::set-output name=archive_name::${{ matrix.artifact_name }}.zip"
+          else
+            # Linux 和 macOS 直接压缩可执行文件
+            TAR_GZ_FILE="${{ matrix.artifact_name }}.tar.gz"
+            cd "$ARTIFACT_PATH"
+            tar -czvf "$TAR_GZ_FILE" "$EXECUTABLE_NAME"
+            echo "::set-output name=zip_path::${{ github.workspace }}/${ARTIFACT_PATH}/$TAR_GZ_FILE"
+            echo "::set-output name=archive_name::${{ matrix.artifact_name }}.tar.gz"
+          fi
+        shell: bash # 明确指定 shell 为 bash，确保跨平台脚本兼容性
+
+      - name: Upload artifact to GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') # 仅当是标签推送时才创建/更新 Release
+        with:
+          files: ${{ steps.prepare_artifact.outputs.zip_path }}
+          prerelease: false # 设置为 true 如果是预发布版本
+          tag_name: ${{ github.ref }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动提供的 Token
